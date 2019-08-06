@@ -540,7 +540,7 @@ class Trainer:
         for l, v in losses.items():
             writer.add_scalar("{}".format(l), v, self.step)
 
-        for j in range(4):  # only write four images
+        for j in range(min(4, self.opt.batch_size)):  # write a maxmimum of four images
             for s in self.opt.scales:
                 for frame_id in self.opt.frame_ids:
                     writer.add_image(
@@ -553,17 +553,19 @@ class Trainer:
 
                 writer.add_image(
                     "disp_{}/{}".format(s, j),
-                    normalize_image(outputs[("disp", s)][j, 0]), self.step)
+                    normalize_image(outputs[("disp", s)][j]), self.step)
 
                 if self.opt.predictive_mask:
-                    writer.add_image(
-                        "predictive_mask_{}/{}".format(s, j),
-                        outputs["predictive_mask"][("disp", s)][j, 0], self.step)
+                    for f_idx, frame_id in enumerate(self.opt.frame_ids[1:]):
+                        writer.add_image(
+                            "predictive_mask_{}_{}/{}".format(frame_id, s, j),
+                            outputs["predictive_mask"][("disp", s)][j, f_idx][None, ...],
+                            self.step)
 
                 elif not self.opt.disable_automasking:
                     writer.add_image(
                         "automask_{}/{}".format(s, j),
-                        outputs["identity_selection/{}".format(s)][j], self.step)
+                        outputs["identity_selection/{}".format(s)][j][None, ...], self.step)
 
     def save_opts(self):
         """Save options to disk so we know what we ran this experiment with
