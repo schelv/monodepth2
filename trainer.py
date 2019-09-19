@@ -6,24 +6,18 @@
 
 from __future__ import absolute_import, division, print_function
 
-import numpy as np
+import json
 import time
 
-import torch
-import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader
 from tensorboardX import SummaryWriter
-
-import json
-
-from utils import *
-from kitti_utils import *
-from layers import *
+from torch.utils.data import DataLoader
 
 import datasets
 import networks
-from IPython import embed
+from kitti_utils import *
+from layers import *
+from utils import *
 
 
 class Trainer:
@@ -245,8 +239,24 @@ class Trainer:
             outputs = self.models["depth"](features[0])
         else:
             # Otherwise, we only feed the image with frame_id 0 through the depth encoder
+            outputs ={}
             features = self.models["encoder"](inputs["color_aug", 0, 0])
-            outputs = self.models["depth"](features)
+            frame_outputs = self.models["depth"](features)
+
+            for key, value in frame_outputs.items():
+                outputs[(key[0], 0, key[1])] = value
+
+            # these predictions are only used for occlusion mask calculations.
+            self.set_eval()
+            with torch.no_grad():
+                for frame_id in self.opt.frame_ids[1:]:
+                    features = self.models["encoder"](inputs["color_aug", frame_id, 0])
+                    frame_outputs = self.models["depth"](features)
+
+                    for key, value in frame_outputs.items():
+                        outputs[(key[0], frame_id, key[1])] = value
+
+            self.set_train()
 
         if self.opt.predictive_mask:
             outputs["predictive_mask"] = self.models["predictive_mask"](features)
@@ -343,7 +353,7 @@ class Trainer:
         Generated images are saved into the `outputs` dictionary.
         """
         for scale in self.opt.scales:
-            disp = outputs[("disp", scale)]
+            disp = outputs[("disp", 0, scale)]
             if self.opt.v1_multiscale:
                 source_scale = scale
             else:
@@ -376,10 +386,33 @@ class Trainer:
 
                 cam_points = self.backproject_depth[source_scale](
                     depth, inputs[("inv_K", source_scale)])
-                pix_coords = self.project_3d[source_scale](
+                sample_coords, projected_depth = self.project_3d[source_scale](
                     cam_points, inputs[("K", source_scale)], T)
 
-                outputs[("sample", frame_id, scale)] = pix_coords
+                outputs[("sample", frame_id, scale)] = sample_coords
+
+                predicted_source_disp = outputs[("disp", frame_id, scale)]
+                if self.opt.v1_multiscale:
+                    source_scale = scale
+                else:
+                    predicted_source_disp = F.interpolate(
+                        predicted_source_disp, [self.opt.height, self.opt.width], mode="bilinear", align_corners=False)
+                    source_scale = 0
+
+                _, predicted_source_depth = disp_to_depth(predicted_source_disp,
+                                                                  self.opt.min_depth,
+                                                                  self.opt.max_depth)
+
+                occlusion_mask, sampled_predicted_source_depth = self.compute_occlusion_mask(
+                    predicted_source_depth, projected_depth, sample_coords)
+
+                # expected disp at sample locations.
+                expected_disp = depth_to_disp(projected_depth, self.opt.min_depth, self.opt.max_depth)
+                sampled_predicted_source_disp = depth_to_disp(sampled_predicted_source_depth, self.opt.min_depth, self.opt.max_depth)
+
+                outputs[("exp_sampled_disp", frame_id, scale)] = expected_disp
+                outputs[("pred_sampled_disp", frame_id, scale)] = sampled_predicted_source_disp
+                outputs[("occlusion_mask", frame_id, scale)] = occlusion_mask
 
                 outputs[("color", frame_id, scale)] = F.grid_sample(
                     inputs[("color", frame_id, source_scale)],
@@ -389,6 +422,29 @@ class Trainer:
                 if not self.opt.disable_automasking:
                     outputs[("color_identity", frame_id, scale)] = \
                         inputs[("color", frame_id, source_scale)]
+
+    def compute_occlusion_mask(self, predicted_source_depth, expected_depth, sample_coords):
+        # find occlusions by comparing the ..
+        # reprojected (target) depth prediction with the sampled source depth prediction.
+
+        # predicted source depth at sample locations
+        sampled_predicted_source_depth = F.grid_sample(
+            predicted_source_depth,
+            sample_coords,
+            padding_mode="border")
+
+        # something is occluded when
+        # the view is blocked by something closer..
+        base_tolerance = 0.3
+        occlusion_mask = sampled_predicted_source_depth < expected_depth * (1 - base_tolerance)
+        # image boundary occlusion
+        outside_source_image = torch.lt(sample_coords, -1) | torch.gt(sample_coords, 1)
+        boundary_occlusion = torch.any(outside_source_image, dim=3)
+        boundary_occlusion = boundary_occlusion.unsqueeze(1)
+        occlusion_mask = occlusion_mask | boundary_occlusion
+        # occlusion mask now shows the visible regions
+        occlusion_mask = 1 - occlusion_mask
+        return occlusion_mask, sampled_predicted_source_depth
 
     def compute_reprojection_loss(self, pred, target):
         """Computes reprojection loss between a batch of predicted and target images
@@ -419,7 +475,7 @@ class Trainer:
             else:
                 source_scale = 0
 
-            disp = outputs[("disp", scale)]
+            disp = outputs[("disp", 0, scale)]
             color = inputs[("color", 0, scale)]
             target = inputs[("color", 0, source_scale)]
 
@@ -428,6 +484,19 @@ class Trainer:
                 reprojection_losses.append(self.compute_reprojection_loss(pred, target))
 
             reprojection_losses = torch.cat(reprojection_losses, 1)
+
+            if not self.opt.disable_occlusion_masking:
+                occlusions_masks = []
+                for frame_id in self.opt.frame_ids[1:]:
+                    occlusion_mask = outputs[("occlusion_mask", frame_id, scale)]
+                    occlusions_masks.append(occlusion_mask)
+
+                occlusions_masks = torch.cat(occlusions_masks, 1)
+                # make occluded regions have a value of 1
+                occlusions_masks = 1 - occlusions_masks
+
+                # add it to the reprojection losses to ignore occluded
+                reprojection_losses += occlusions_masks.float()
 
             if not self.opt.disable_automasking:
                 identity_reprojection_losses = []
@@ -477,9 +546,14 @@ class Trainer:
             else:
                 to_optimise, idxs = torch.min(combined, dim=1)
 
+            outputs["loss_image/{}".format(scale)] = to_optimise
+
             if not self.opt.disable_automasking:
                 outputs["identity_selection/{}".format(scale)] = (
                     idxs > identity_reprojection_loss.shape[1] - 1).float()
+
+            if not self.opt.disable_occlusion_masking:
+                outputs["occlusion_masks/{}".format(scale)] = occlusions_masks.float()
 
             loss += to_optimise.mean()
 
@@ -557,19 +631,30 @@ class Trainer:
 
                 writer.add_image(
                     "disp_{}/{}".format(s, j),
-                    normalize_image(outputs[("disp", s)][j]), self.step)
+                    normalize_image(outputs[("disp", 0, s)][j]), self.step)
+
+                writer.add_image(
+                    "loss_image_{}/{}".format(s, j),
+                    normalize_image(outputs["loss_image/{}".format(s)][j][None, ...]), self.step)
 
                 if self.opt.predictive_mask:
-                    for f_idx, frame_id in enumerate(self.opt.frame_ids[1:]):
-                        writer.add_image(
-                            "predictive_mask_{}_{}/{}".format(frame_id, s, j),
-                            outputs["predictive_mask"][("disp", s)][j, f_idx][None, ...],
-                            self.step)
+                    writer.add_image(
+                        "predictive_mask_{}/{}".format(s, j),
+                        outputs["predictive_mask"][("disp", s)][j, 0], self.step)
 
-                elif not self.opt.disable_automasking:
+                if not self.opt.disable_automasking:
                     writer.add_image(
                         "automask_{}/{}".format(s, j),
                         outputs["identity_selection/{}".format(s)][j][None, ...], self.step)
+
+                if not self.opt.disable_occlusion_masking:
+                    writer.add_image(
+                        "occlusion_mask_0_{}/{}".format(s, j),
+                        outputs["occlusion_masks/{}".format(s)][j][None, 0, ...], self.step)
+
+                    writer.add_image(
+                        "occlusion_mask_1_{}/{}".format(s, j),
+                        outputs["occlusion_masks/{}".format(s)][j][None, 1, ...], self.step)
 
     def save_opts(self):
         """Save options to disk so we know what we ran this experiment with
@@ -615,7 +700,7 @@ class Trainer:
             print("Loading {} weights...".format(n))
             path = os.path.join(self.opt.load_weights_folder, "{}.pth".format(n))
             model_dict = self.models[n].state_dict()
-            pretrained_dict = torch.load(path)
+            pretrained_dict = torch.load(path, map_location='cpu')
             pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
             model_dict.update(pretrained_dict)
             self.models[n].load_state_dict(model_dict)

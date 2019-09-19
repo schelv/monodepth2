@@ -111,6 +111,9 @@ class MonodepthOptions:
         self.parser.add_argument("--disable_automasking",
                                  help="if set, doesn't do auto-masking",
                                  action="store_true")
+        self.parser.add_argument("--disable_occlusion_masking",
+                                 help="if set, doesn't do occlusion masking",
+                                 action="store_true")
         self.parser.add_argument("--predictive_mask",
                                  help="if set, uses a predictive masking scheme as in Zhou et al",
                                  action="store_true")

@@ -25,6 +25,16 @@ def disp_to_depth(disp, min_depth, max_depth):
     return scaled_disp, depth
 
 
+def depth_to_disp(depth, min_depth, max_depth):
+    min_disp = 1 / max_depth
+    max_disp = 1 / min_depth
+
+    scaled_disp = 1 / depth
+    disp = (scaled_disp - min_disp) / (max_disp - min_disp)
+
+    return disp
+
+
 def transformation_from_parameters(axisangle, translation, invert=False):
     """Convert the network's (axisangle, translation) output into a 4x4 matrix
     """
@@ -184,13 +194,17 @@ class Project3D(nn.Module):
 
         cam_points = torch.matmul(P, points)
 
-        pix_coords = cam_points[:, :2, :] / (cam_points[:, 2, :].unsqueeze(1) + self.eps)
+        z = (cam_points[:, 2, :].unsqueeze(1) + self.eps)
+        pix_coords = cam_points[:, :2, :] / z
+
+        z = z.view(self.batch_size, 1, self.height, self.width)
+
         pix_coords = pix_coords.view(self.batch_size, 2, self.height, self.width)
         pix_coords = pix_coords.permute(0, 2, 3, 1)
         pix_coords[..., 0] /= self.width - 1
         pix_coords[..., 1] /= self.height - 1
         pix_coords = (pix_coords - 0.5) * 2
-        return pix_coords
+        return pix_coords, z
 
 
 def upsample(x):
