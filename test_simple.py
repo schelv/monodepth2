@@ -33,6 +33,8 @@ def parse_args():
                         help='name of a pretrained model to use',
                         choices=[
                             "mono_640x192",
+                            "non_occluded_min_640x192",
+                            "non_occluded_avg_640x192",
                             "stereo_640x192",
                             "mono+stereo_640x192",
                             "mono_no_pt_640x192",

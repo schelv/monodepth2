@@ -56,6 +56,12 @@ def download_model_if_doesnt_exist(model_name):
         "mono_640x192":
             ("https://storage.googleapis.com/niantic-lon-static/research/monodepth2/mono_640x192.zip",
              "a964b8356e08a02d009609d9e3928f7c"),
+        "non_occluded_avg_640x192":
+            ("https://drive.google.com/uc?id=1JgcoiOVFX0ytfruCDeCtQ0SqJEMJetbY&export=download",
+             "a4805a28b3442055cb30cd01de116cb8"),
+        "non_occluded_min_640x192":
+            ("https://drive.google.com/uc?id=1oOKCqym06lrM4DF7ye6UCFoT2lH0N3W_&export=download",
+             "8c01d09baad791622f9aef979713faee"),
         "stereo_640x192":
             ("https://storage.googleapis.com/niantic-lon-static/research/monodepth2/stereo_640x192.zip",
              "3dfb76bcff0786e4ec07ac00f658dd07"),
